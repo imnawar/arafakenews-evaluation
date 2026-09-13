@@ -12,7 +12,7 @@ from datetime import datetime
 
 st.set_page_config(page_title="تقييم واقعية الصور", layout="centered")
 
-st.title("📰 تقييم مدى واقعية صور الأخبار المزيفة")
+st.title("1111📰 تقييم مدى واقعية صور الأخبار المزيفة")
 st.caption("ملاحظة: جميع الأخبار المعروضة في هذا الاستبيان **مُولّدة اصطناعياً (مزيفة)**. المطلوب هو تقييم مدى واقعية الصورة، وليس تحديد ما إذا كانت حقيقية أم لا.")
 
 # ==========================================
@@ -25,6 +25,7 @@ CSV_PATH = os.path.join(IMAGES_DIR, "generated_image_dataset_filtered.csv")
 DEMOGRAPHICS_CSV_PATH = os.path.join(IMAGES_DIR, "user_demographics.csv")
 
 MAX_IMAGES_PER_USER = 25
+MAX_EVALS_PER_IMAGE = 3
 
 # ==========================================
 # 🔹 Auto-generated user ID
@@ -147,17 +148,9 @@ if not st.session_state.demographics_done:
     st.stop()
 
 # ==========================================
-# 🔹 Load dataset
+# 🔹 Load dataset (with column/dtype fixes) — reusable
 # ==========================================
-df = pd.read_csv(CSV_PATH)
-
-# Keep only rows with images
-df = df[df["generated_image_path"].notna()]
-
-# ==========================================
-# 🔹 Create evaluation columns if missing
-# ==========================================
-required_cols = [
+REQUIRED_COLS = [
     "eval_image_1", "eval_image_2", "eval_image_3",
     "eval_title_1", "eval_title_2", "eval_title_3",
     "user_1", "user_2", "user_3",
@@ -166,36 +159,59 @@ required_cols = [
     "final_score_title"
 ]
 
-for col in required_cols:
-
-    if col not in df.columns:
-
-        if col == "eval_count":
-            df[col] = 0
-        else:
-            df[col] = ""
-
-# Ensure correct dtypes regardless of what was inferred when reading the CSV
-# (empty cells get read back as NaN/float64, which then rejects string writes)
-text_cols = [
+TEXT_COLS = [
     "eval_image_1", "eval_image_2", "eval_image_3",
     "eval_title_1", "eval_title_2", "eval_title_3",
     "user_1", "user_2", "user_3",
     "final_score_image", "final_score_title"
 ]
 
-for col in text_cols:
-    df[col] = df[col].astype(object).where(df[col].notna(), "")
 
-df["eval_count"] = pd.to_numeric(df["eval_count"], errors="coerce").fillna(0).astype(int)
+def load_dataset():
+
+    _df = pd.read_csv(CSV_PATH)
+
+    # Keep only rows with images
+    _df = _df[_df["generated_image_path"].notna()]
+
+    # Create evaluation columns if missing
+    for col in REQUIRED_COLS:
+
+        if col not in _df.columns:
+
+            if col == "eval_count":
+                _df[col] = 0
+            else:
+                _df[col] = ""
+
+    # Ensure correct dtypes regardless of what was inferred when reading the CSV
+    # (empty cells get read back as NaN/float64, which then rejects string writes)
+    for col in TEXT_COLS:
+        _df[col] = _df[col].astype(object).where(_df[col].notna(), "")
+
+    _df["eval_count"] = pd.to_numeric(_df["eval_count"], errors="coerce").fillna(0).astype(int)
+
+    return _df
+
+
+df = load_dataset()
 
 # Save back so the columns persist even before the first rating is submitted
 df.to_csv(CSV_PATH, index=False)
 
 # ==========================================
-# 🔹 Keep rows with < 3 evaluations
+# 🔹 Keep rows with < MAX_EVALS_PER_IMAGE evaluations
 # ==========================================
-remaining = df[df["eval_count"] < 3]
+remaining = df[df["eval_count"] < MAX_EVALS_PER_IMAGE]
+
+# ==========================================
+# 🔹 Global completion check — every image has reached the max evaluations
+# ==========================================
+if remaining.empty:
+
+    st.balloons()
+    st.success("🎉 شكرًا لمشاركتكم، تم تقييم جميع الصور")
+    st.stop()
 
 # ==========================================
 # 🔹 Initialize random 25 images for user
@@ -232,9 +248,9 @@ current_idx = st.session_state.assigned_indices[
 current_row = df.loc[current_idx]
 
 # ==========================================
-# 🔹 Skip if already evaluated 3 times
+# 🔹 Skip if already evaluated MAX_EVALS_PER_IMAGE times
 # ==========================================
-if int(current_row["eval_count"]) >= 3:
+if int(current_row["eval_count"]) >= MAX_EVALS_PER_IMAGE:
 
     st.session_state.current_position += 1
     st.rerun()
@@ -312,7 +328,18 @@ title_rating = st.slider(
 # ==========================================
 if st.button("إرسال"):
 
-    eval_count = int(df.at[current_idx, "eval_count"])
+    # Reload fresh from disk (with the same dtype fixes) in case another
+    # user just submitted an evaluation for this same image moments ago
+    latest_df = load_dataset()
+    eval_count = int(latest_df.at[current_idx, "eval_count"])
+
+    if eval_count >= MAX_EVALS_PER_IMAGE:
+
+        st.warning("⚠️ تم تقييم هذه الصورة بالفعل من قِبل 3 مستخدمين آخرين، سيتم الانتقال للصورة التالية")
+        st.session_state.current_position += 1
+        st.rerun()
+
+    df = latest_df
 
     # --------------------------------------
     # Store evaluations separately
