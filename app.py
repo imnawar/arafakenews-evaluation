@@ -1,14 +1,21 @@
-# AraFakeNews human-evaluation Streamlit app
-# Extracted from the final %%writefile app.py cell in Untitled135.ipynb.
-# Deployment adaptation: data/image paths are resolved relative to this repository
-# so the app is not dependent on Google Colab's /content/... paths.
+# AraFakeNews human-evaluation Streamlit app — Supabase-backed version
+#
+# Storage design:
+#   - Item metadata (title, image path, caption) stays in a local CSV,
+#     since it's static and never written to concurrently.
+#   - Evaluator demographics -> Supabase "participants" table
+#   - Ratings                -> Supabase "evaluations" table
+# This avoids any concurrent read/modify/write on a shared CSV file,
+# which is unsafe on platforms like Streamlit Community Cloud where
+# the filesystem is ephemeral and shared across sessions.
 
 import streamlit as st
 import pandas as pd
 import os
 import random
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from supabase import create_client
 
 st.set_page_config(page_title="تقييم واقعية الصور", layout="centered")
 
@@ -21,11 +28,27 @@ st.caption("ملاحظة: جميع الأخبار المعروضة في هذا �
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 IMAGES_DIR = os.path.join(DATA_DIR, "GeneratedImagesToEvaluate")
-CSV_PATH = os.path.join(IMAGES_DIR, "generated_image_dataset_filtered.csv")
-DEMOGRAPHICS_CSV_PATH = os.path.join(IMAGES_DIR, "user_demographics.csv")
+
+# Static item metadata only (title, image path, caption). No evaluation
+# columns live here anymore — those are all in Supabase.
+ITEMS_CSV_PATH = os.path.join(IMAGES_DIR, "generated_image_dataset_filtered.csv")
 
 MAX_IMAGES_PER_USER = 25
 MAX_EVALS_PER_IMAGE = 3
+
+# ==========================================
+# 🔹 Supabase client
+# ==========================================
+# Requires SUPABASE_URL and SUPABASE_KEY in .streamlit/secrets.toml
+# (locally) or in the app's "Secrets" settings (Streamlit Cloud).
+@st.cache_resource
+def get_supabase_client():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+
+
+supabase = get_supabase_client()
 
 # ==========================================
 # 🔹 Auto-generated user ID
@@ -118,121 +141,107 @@ if not st.session_state.demographics_done:
 
         if submitted:
 
-            demo_row = {
-                "user_id": user_id,
-                "timestamp": datetime.now().isoformat(),
-                "age_group": age_group,
-                "gender": gender,
-                "education_stage": education_stage,
-                "field_of_study": field_of_study,
-                "social_media_usage": social_media_usage,
-                "media_trust": media_trust,
-                "news_verification_habit": news_verification_habit,
-            }
+            try:
+                supabase.table("participants").insert({
+                    "user_id": user_id,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "age_group": age_group,
+                    "gender": gender,
+                    "education_stage": education_stage,
+                    "field_of_study": field_of_study,
+                    "social_media_usage": social_media_usage,
+                    "media_trust": media_trust,
+                    "news_verification_habit": news_verification_habit,
+                }).execute()
 
-            # Append to demographics CSV (create if not exists)
-            if os.path.exists(DEMOGRAPHICS_CSV_PATH):
-                demo_df = pd.read_csv(DEMOGRAPHICS_CSV_PATH)
-                demo_df = pd.concat(
-                    [demo_df, pd.DataFrame([demo_row])],
-                    ignore_index=True
-                )
-            else:
-                demo_df = pd.DataFrame([demo_row])
+                st.session_state.demographics_done = True
+                st.rerun()
 
-            demo_df.to_csv(DEMOGRAPHICS_CSV_PATH, index=False)
-
-            st.session_state.demographics_done = True
-            st.rerun()
+            except Exception as e:
+                st.error(f"⚠️ حدث خطأ أثناء حفظ البيانات، الرجاء المحاولة مرة أخرى.\n\n{e}")
 
     st.stop()
 
 # ==========================================
-# 🔹 Load dataset (with column/dtype fixes) — reusable
+# 🔹 Load static item metadata (title, image path, caption)
 # ==========================================
-REQUIRED_COLS = [
-    "eval_image_1", "eval_image_2", "eval_image_3",
-    "eval_title_1", "eval_title_2", "eval_title_3",
-    "user_1", "user_2", "user_3",
-    "eval_count",
-    "final_score_image",
-    "final_score_title"
+items_df = pd.read_csv(ITEMS_CSV_PATH)
+items_df = items_df[items_df["generated_image_path"].notna()].copy()
+
+# Stable identifier for each item — filename of the image.
+items_df["image_id"] = items_df["generated_image_path"].apply(
+    lambda p: os.path.basename(str(p))
+)
+
+items_df = items_df.set_index("image_id", drop=False)
+
+# ==========================================
+# 🔹 Fetch current evaluation counts from Supabase
+# ==========================================
+@st.cache_data(ttl=5)
+def fetch_eval_counts():
+    """Returns {image_id: count} for all evaluations recorded so far."""
+    response = supabase.table("evaluations").select("image_id").execute()
+    rows = response.data or []
+    counts = pd.Series([r["image_id"] for r in rows]).value_counts()
+    return counts.to_dict()
+
+
+@st.cache_data(ttl=5)
+def fetch_user_rated_image_ids(uid):
+    """Image IDs this specific user has already rated (avoids duplicates)."""
+    response = (
+        supabase.table("evaluations")
+        .select("image_id")
+        .eq("user_id", uid)
+        .execute()
+    )
+    rows = response.data or []
+    return {r["image_id"] for r in rows}
+
+
+eval_counts = fetch_eval_counts()
+already_rated_by_user = fetch_user_rated_image_ids(user_id)
+
+items_df["eval_count"] = items_df["image_id"].map(eval_counts).fillna(0).astype(int)
+
+# ==========================================
+# 🔹 Keep rows with < MAX_EVALS_PER_IMAGE evaluations,
+#    excluding ones this user already rated
+# ==========================================
+remaining = items_df[
+    (items_df["eval_count"] < MAX_EVALS_PER_IMAGE)
+    & (~items_df["image_id"].isin(already_rated_by_user))
 ]
-
-TEXT_COLS = [
-    "eval_image_1", "eval_image_2", "eval_image_3",
-    "eval_title_1", "eval_title_2", "eval_title_3",
-    "user_1", "user_2", "user_3",
-    "final_score_image", "final_score_title"
-]
-
-
-def load_dataset():
-
-    _df = pd.read_csv(CSV_PATH)
-
-    # Keep only rows with images
-    _df = _df[_df["generated_image_path"].notna()]
-
-    # Create evaluation columns if missing
-    for col in REQUIRED_COLS:
-
-        if col not in _df.columns:
-
-            if col == "eval_count":
-                _df[col] = 0
-            else:
-                _df[col] = ""
-
-    # Ensure correct dtypes regardless of what was inferred when reading the CSV
-    # (empty cells get read back as NaN/float64, which then rejects string writes)
-    for col in TEXT_COLS:
-        _df[col] = _df[col].astype(object).where(_df[col].notna(), "")
-
-    _df["eval_count"] = pd.to_numeric(_df["eval_count"], errors="coerce").fillna(0).astype(int)
-
-    return _df
-
-
-df = load_dataset()
-
-# Save back so the columns persist even before the first rating is submitted
-df.to_csv(CSV_PATH, index=False)
-
-# ==========================================
-# 🔹 Keep rows with < MAX_EVALS_PER_IMAGE evaluations
-# ==========================================
-remaining = df[df["eval_count"] < MAX_EVALS_PER_IMAGE]
 
 # ==========================================
 # 🔹 Global completion check — every image has reached the max evaluations
 # ==========================================
-if remaining.empty:
+if (items_df["eval_count"] >= MAX_EVALS_PER_IMAGE).all():
 
     st.balloons()
     st.success("🎉 شكرًا لمشاركتكم، تم تقييم جميع الصور")
     st.stop()
 
 # ==========================================
-# 🔹 Initialize random 25 images for user
+# 🔹 Initialize random batch of images for this user
 # ==========================================
-if "assigned_indices" not in st.session_state:
+if "assigned_ids" not in st.session_state:
 
-    available_indices = remaining.index.tolist()
+    available_ids = remaining["image_id"].tolist()
 
-    sample_size = min(MAX_IMAGES_PER_USER, len(available_indices))
+    sample_size = min(MAX_IMAGES_PER_USER, len(available_ids))
 
-    st.session_state.assigned_indices = random.sample(
-        available_indices,
-        sample_size
-    )
-
+    st.session_state.assigned_ids = random.sample(available_ids, sample_size)
     st.session_state.current_position = 0
 
 # ==========================================
 # 🔹 User completed all assigned images
 # ==========================================
-if st.session_state.current_position >= len(st.session_state.assigned_indices):
+if (
+    len(st.session_state.assigned_ids) == 0
+    or st.session_state.current_position >= len(st.session_state.assigned_ids)
+):
 
     st.balloons()
     st.success("🎉 انتهى التقييم، شكراً لمشاركتك!")
@@ -241,16 +250,14 @@ if st.session_state.current_position >= len(st.session_state.assigned_indices):
 # ==========================================
 # 🔹 Current image
 # ==========================================
-current_idx = st.session_state.assigned_indices[
-    st.session_state.current_position
-]
-
-current_row = df.loc[current_idx]
+current_image_id = st.session_state.assigned_ids[st.session_state.current_position]
+current_row = items_df.loc[current_image_id]
 
 # ==========================================
-# 🔹 Skip if already evaluated MAX_EVALS_PER_IMAGE times
+# 🔹 Skip if this image reached the max in the meantime
 # ==========================================
-if int(current_row["eval_count"]) >= MAX_EVALS_PER_IMAGE:
+latest_counts = fetch_eval_counts()  # cached for 5s, cheap to call
+if latest_counts.get(current_image_id, 0) >= MAX_EVALS_PER_IMAGE:
 
     st.session_state.current_position += 1
     st.rerun()
@@ -260,14 +267,14 @@ if int(current_row["eval_count"]) >= MAX_EVALS_PER_IMAGE:
 # ==========================================
 progress = (
     st.session_state.current_position + 1
-) / len(st.session_state.assigned_indices)
+) / len(st.session_state.assigned_ids)
 
 st.progress(progress)
 
 st.markdown(
     f"### 🧾 الخبر رقم "
     f"{st.session_state.current_position + 1}"
-    f" / {len(st.session_state.assigned_indices)}"
+    f" / {len(st.session_state.assigned_ids)}"
 )
 
 # ==========================================
@@ -280,7 +287,6 @@ st.subheader(current_row["title"])
 # ==========================================
 img_path = current_row["generated_image_path"]
 
-# Support both the old Colab /content/... paths and relative filenames.
 if pd.notna(img_path):
     img_path = str(img_path)
     if not os.path.isabs(img_path) or not os.path.exists(img_path):
@@ -328,81 +334,40 @@ title_rating = st.slider(
 # ==========================================
 if st.button("إرسال"):
 
-    # Reload fresh from disk (with the same dtype fixes) in case another
-    # user just submitted an evaluation for this same image moments ago
-    latest_df = load_dataset()
-    eval_count = int(latest_df.at[current_idx, "eval_count"])
+    # Re-check the live count right before inserting (race-condition safety).
+    # Bypass the 5s cache here since we need the true current count.
+    fresh_response = (
+        supabase.table("evaluations")
+        .select("image_id")
+        .eq("image_id", current_image_id)
+        .execute()
+    )
+    fresh_count = len(fresh_response.data or [])
 
-    if eval_count >= MAX_EVALS_PER_IMAGE:
+    if fresh_count >= MAX_EVALS_PER_IMAGE:
 
         st.warning("⚠️ تم تقييم هذه الصورة بالفعل من قِبل 3 مستخدمين آخرين، سيتم الانتقال للصورة التالية")
         st.session_state.current_position += 1
+        st.cache_data.clear()
         st.rerun()
 
-    df = latest_df
+    try:
+        supabase.table("evaluations").insert({
+            "user_id": user_id,
+            "image_id": current_image_id,
+            "image_rating": image_rating,
+            "title_rating": title_rating,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
 
-    # --------------------------------------
-    # Store evaluations separately
-    # --------------------------------------
-    if eval_count == 0:
+        st.success("✅ تم حفظ التقييم بنجاح")
 
-        df.at[current_idx, "eval_image_1"] = image_rating
-        df.at[current_idx, "eval_title_1"] = title_rating
-        df.at[current_idx, "user_1"] = user_id
+    except Exception as e:
+        # Most likely a duplicate (unique constraint on image_id+user_id)
+        st.warning(f"⚠️ لم يتم حفظ هذا التقييم (ربما تم إرساله مسبقاً). سيتم الانتقال للصورة التالية.\n\n{e}")
 
-    elif eval_count == 1:
+    # Clear cached counts so the next page load reflects this submission
+    st.cache_data.clear()
 
-        df.at[current_idx, "eval_image_2"] = image_rating
-        df.at[current_idx, "eval_title_2"] = title_rating
-        df.at[current_idx, "user_2"] = user_id
-
-    elif eval_count == 2:
-
-        df.at[current_idx, "eval_image_3"] = image_rating
-        df.at[current_idx, "eval_title_3"] = title_rating
-        df.at[current_idx, "user_3"] = user_id
-
-    # --------------------------------------
-    # Increment evaluation count
-    # --------------------------------------
-    df.at[current_idx, "eval_count"] = eval_count + 1
-
-    # --------------------------------------
-    # Final average scores (image & title, separately)
-    # --------------------------------------
-    image_scores = [
-        df.at[current_idx, "eval_image_1"],
-        df.at[current_idx, "eval_image_2"],
-        df.at[current_idx, "eval_image_3"]
-    ]
-
-    title_scores = [
-        df.at[current_idx, "eval_title_1"],
-        df.at[current_idx, "eval_title_2"],
-        df.at[current_idx, "eval_title_3"]
-    ]
-
-    valid_image_scores = [s for s in image_scores if pd.notna(s) and s != ""]
-    valid_title_scores = [s for s in title_scores if pd.notna(s) and s != ""]
-
-    if len(valid_image_scores) == 3:
-        avg_image_score = sum(map(float, valid_image_scores)) / 3
-        df.at[current_idx, "final_score_image"] = round(avg_image_score, 2)
-
-    if len(valid_title_scores) == 3:
-        avg_title_score = sum(map(float, valid_title_scores)) / 3
-        df.at[current_idx, "final_score_title"] = round(avg_title_score, 2)
-
-    # --------------------------------------
-    # Save updated CSV
-    # --------------------------------------
-    df.to_csv(CSV_PATH, index=False)
-
-    st.success("✅ تم حفظ التقييم بنجاح")
-
-    # --------------------------------------
-    # Move to next image
-    # --------------------------------------
     st.session_state.current_position += 1
-
     st.rerun()
