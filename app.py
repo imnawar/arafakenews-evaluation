@@ -138,7 +138,6 @@ if not st.session_state.demographics_done:
         social_media_usage = st.selectbox(
             "ما مدى استخدامك لوسائل التواصل الاجتماعي؟",
             [
-                "بشكل يومي ومتكرر",
                 "يومياً",
                 "عدة مرات أسبوعياً",
                 "نادراً",
@@ -146,10 +145,10 @@ if not st.session_state.demographics_done:
             ]
         )
 
-        media_trust = st.select_slider(
+        media_trust = st.radio(
             "بشكل عام، ما مدى ثقتك بوسائل الإعلام ومصادر الأخبار؟",
-            options=["منخفضة جداً", "منخفضة", "متوسطة", "عالية", "عالية جداً"],
-            value="متوسطة"
+            ["منخفضة جداً", "منخفضة", "متوسطة", "عالية", "عالية جداً"],
+            horizontal=True
         )
 
         news_verification_habit = st.radio(
