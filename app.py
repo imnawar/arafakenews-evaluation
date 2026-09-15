@@ -19,6 +19,27 @@ from supabase import create_client
 
 st.set_page_config(page_title="تقييم واقعية الصور", layout="centered")
 
+# ==========================================
+# 🔹 RTL fix for sliders
+# ==========================================
+# Streamlit's slider is LTR by default (min on the left), which feels
+# backwards in an Arabic-language form. This mirrors the slider track
+# so the minimum value sits on the right, matching RTL reading order.
+st.markdown(
+    """
+    <style>
+    div[data-testid="stSlider"] {
+        direction: rtl;
+    }
+    div[data-testid="stSlider"] label {
+        direction: rtl;
+        text-align: right;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("📰 تقييم مدى واقعية صور الأخبار المزيفة")
 st.caption("ملاحظة: جميع الأخبار المعروضة في هذا الاستبيان **مُولّدة اصطناعياً (مزيفة)**. المطلوب هو تقييم مدى واقعية الصورة، وليس تحديد ما إذا كانت حقيقية أم لا.")
 
@@ -165,15 +186,20 @@ if not st.session_state.demographics_done:
 # ==========================================
 # 🔹 Load static item metadata (title, image path, caption)
 # ==========================================
-items_df = pd.read_csv(ITEMS_CSV_PATH)
-items_df = items_df[items_df["generated_image_path"].notna()].copy()
+@st.cache_data
+def load_items():
+    _items_df = pd.read_csv(ITEMS_CSV_PATH)
+    _items_df = _items_df[_items_df["generated_image_path"].notna()].copy()
 
-# Stable identifier for each item — filename of the image.
-items_df["image_id"] = items_df["generated_image_path"].apply(
-    lambda p: os.path.basename(str(p))
-)
+    # Stable identifier for each item — filename of the image.
+    _items_df["image_id"] = _items_df["generated_image_path"].apply(
+        lambda p: os.path.basename(str(p))
+    )
 
-items_df = items_df.set_index("image_id", drop=False)
+    return _items_df.set_index("image_id", drop=False)
+
+
+items_df = load_items()
 
 # ==========================================
 # 🔹 Fetch current evaluation counts from Supabase
@@ -255,9 +281,17 @@ current_row = items_df.loc[current_image_id]
 
 # ==========================================
 # 🔹 Skip if this image reached the max in the meantime
+#    (lightweight query — only this one image, not the whole table)
 # ==========================================
-latest_counts = fetch_eval_counts()  # cached for 5s, cheap to call
-if latest_counts.get(current_image_id, 0) >= MAX_EVALS_PER_IMAGE:
+current_count_response = (
+    supabase.table("evaluations")
+    .select("image_id")
+    .eq("image_id", current_image_id)
+    .execute()
+)
+current_count = len(current_count_response.data or [])
+
+if current_count >= MAX_EVALS_PER_IMAGE:
 
     st.session_state.current_position += 1
     st.rerun()
