@@ -127,7 +127,7 @@ if not st.session_state.demographics_done:
 
         media_trust = st.radio(
             "بشكل عام، ما مدى ثقتك بوسائل الإعلام ومصادر الأخبار؟",
-            "منخفضة جداً", "منخفضة", "متوسطة", "عالية", "عالية جداً",
+            ["منخفضة جداً", "منخفضة", "متوسطة", "عالية", "عالية جداً"],
             horizontal=True
         )
 
@@ -312,7 +312,7 @@ st.caption("تذكير: هذا الخبر والصورة المرفقة مُول
 
 image_rating = st.radio(
     "تقييم الصورة (1 = تبدو مزيفة بشكل واضح، 5 = تبدو واقعية جداً):",
-    ["1", "2", "3", "4", "5"], 
+    ["1", "2", "3", "4", "5"],
     horizontal=True
 )
 
@@ -320,7 +320,7 @@ st.markdown("### إلى أي مدى يبدو هذا العنوان واقعيا�
 
 title_rating = st.radio(
     "تقييم العنوان (1 = يبدو مزيفاً بشكل واضح، 5 = يبدو واقعياً جداً):",
-    ["1", "2", "3", "4", "5"], 
+    ["1", "2", "3", "4", "5"],
     horizontal=True
 )
 
@@ -330,7 +330,6 @@ title_rating = st.radio(
 if st.button("إرسال"):
 
     # Re-check the live count right before inserting (race-condition safety).
-    # Bypass the 5s cache here since we need the true current count.
     fresh_response = (
         supabase.table("evaluations")
         .select("image_id")
@@ -349,8 +348,10 @@ if st.button("إرسال"):
         supabase.table("evaluations").insert({
             "user_id": user_id,
             "image_id": current_image_id,
-            "image_rating": image_rating,
-            "title_rating": title_rating,
+            # radio returns strings ("1".."5") — cast to int to match the
+            # Supabase column type (int, check between 1 and 5)
+            "image_rating": int(image_rating),
+            "title_rating": int(title_rating),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
 
