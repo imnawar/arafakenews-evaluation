@@ -34,7 +34,7 @@ IMAGES_DIR = os.path.join(DATA_DIR, "GeneratedImagesToEvaluate")
 ITEMS_CSV_PATH = os.path.join(IMAGES_DIR, "generated_image_dataset_filtered.csv")
 
 MAX_IMAGES_PER_USER = 25
-MAX_EVALS_PER_IMAGE = 3
+MAX_EVALS_PER_IMAGE = 5
 
 # ==========================================
 # 🔹 Supabase client
@@ -340,7 +340,7 @@ if st.button("إرسال"):
 
     if fresh_count >= MAX_EVALS_PER_IMAGE:
 
-        st.warning("⚠️ تم تقييم هذه الصورة بالفعل من قِبل 3 مستخدمين آخرين، سيتم الانتقال للصورة التالية")
+        st.warning(f"⚠️ تم تقييم هذه الصورة بالفعل من قِبل {MAX_EVALS_PER_IMAGE} مستخدمين آخرين، سيتم الانتقال للصورة التالية")
         st.session_state.current_position += 1
         st.rerun()
 
