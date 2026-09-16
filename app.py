@@ -19,27 +19,6 @@ from supabase import create_client
 
 st.set_page_config(page_title="تقييم واقعية الصور", layout="centered")
 
-# ==========================================
-# 🔹 RTL fix for sliders
-# ==========================================
-# Streamlit's slider is LTR by default (min on the left), which feels
-# backwards in an Arabic-language form. This mirrors the slider track
-# so the minimum value sits on the right, matching RTL reading order.
-st.markdown(
-    """
-    <style>
-    div[data-testid="stSlider"] {
-        direction: rtl;
-    }
-    div[data-testid="stSlider"] label {
-        direction: rtl;
-        text-align: right;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 st.title("📰 تقييم مدى واقعية صور الأخبار المزيفة")
 st.caption("ملاحظة: جميع الأخبار المعروضة في هذا الاستبيان **مُولّدة اصطناعياً (مزيفة)**. المطلوب هو تقييم مدى واقعية الصورة، وليس تحديد ما إذا كانت حقيقية أم لا.")
 
@@ -138,6 +117,7 @@ if not st.session_state.demographics_done:
         social_media_usage = st.selectbox(
             "ما مدى استخدامك لوسائل التواصل الاجتماعي؟",
             [
+                "بشكل يومي ومتكرر",
                 "يومياً",
                 "عدة مرات أسبوعياً",
                 "نادراً",
@@ -147,7 +127,7 @@ if not st.session_state.demographics_done:
 
         media_trust = st.radio(
             "بشكل عام، ما مدى ثقتك بوسائل الإعلام ومصادر الأخبار؟",
-            ["منخفضة جداً", "منخفضة", "متوسطة", "عالية", "عالية جداً"],
+            "منخفضة جداً", "منخفضة", "متوسطة", "عالية", "عالية جداً",
             horizontal=True
         )
 
@@ -202,8 +182,8 @@ items_df = load_items()
 
 # ==========================================
 # 🔹 Fetch current evaluation counts from Supabase
+#    (only called once, when assigning a user's batch — not on every rerun)
 # ==========================================
-@st.cache_data(ttl=5)
 def fetch_eval_counts():
     """Returns {image_id: count} for all evaluations recorded so far."""
     response = supabase.table("evaluations").select("image_id").execute()
@@ -212,7 +192,6 @@ def fetch_eval_counts():
     return counts.to_dict()
 
 
-@st.cache_data(ttl=5)
 def fetch_user_rated_image_ids(uid):
     """Image IDs this specific user has already rated (avoids duplicates)."""
     response = (
@@ -225,33 +204,28 @@ def fetch_user_rated_image_ids(uid):
     return {r["image_id"] for r in rows}
 
 
-eval_counts = fetch_eval_counts()
-already_rated_by_user = fetch_user_rated_image_ids(user_id)
-
-items_df["eval_count"] = items_df["image_id"].map(eval_counts).fillna(0).astype(int)
-
-# ==========================================
-# 🔹 Keep rows with < MAX_EVALS_PER_IMAGE evaluations,
-#    excluding ones this user already rated
-# ==========================================
-remaining = items_df[
-    (items_df["eval_count"] < MAX_EVALS_PER_IMAGE)
-    & (~items_df["image_id"].isin(already_rated_by_user))
-]
-
-# ==========================================
-# 🔹 Global completion check — every image has reached the max evaluations
-# ==========================================
-if (items_df["eval_count"] >= MAX_EVALS_PER_IMAGE).all():
-
-    st.balloons()
-    st.success("🎉 شكرًا لمشاركتكم، تم تقييم جميع الصور")
-    st.stop()
-
 # ==========================================
 # 🔹 Initialize random batch of images for this user
+#    (this is the ONLY place we hit Supabase for counts — once per session)
 # ==========================================
 if "assigned_ids" not in st.session_state:
+
+    eval_counts = fetch_eval_counts()
+    already_rated_by_user = fetch_user_rated_image_ids(user_id)
+
+    items_df["eval_count"] = items_df["image_id"].map(eval_counts).fillna(0).astype(int)
+
+    # Global completion check — every image has reached the max evaluations
+    if (items_df["eval_count"] >= MAX_EVALS_PER_IMAGE).all():
+
+        st.balloons()
+        st.success("🎉 شكرًا لمشاركتكم، تم تقييم جميع الصور")
+        st.stop()
+
+    remaining = items_df[
+        (items_df["eval_count"] < MAX_EVALS_PER_IMAGE)
+        & (~items_df["image_id"].isin(already_rated_by_user))
+    ]
 
     available_ids = remaining["image_id"].tolist()
 
@@ -278,22 +252,12 @@ if (
 current_image_id = st.session_state.assigned_ids[st.session_state.current_position]
 current_row = items_df.loc[current_image_id]
 
-# ==========================================
-# 🔹 Skip if this image reached the max in the meantime
-#    (lightweight query — only this one image, not the whole table)
-# ==========================================
-current_count_response = (
-    supabase.table("evaluations")
-    .select("image_id")
-    .eq("image_id", current_image_id)
-    .execute()
-)
-current_count = len(current_count_response.data or [])
-
-if current_count >= MAX_EVALS_PER_IMAGE:
-
-    st.session_state.current_position += 1
-    st.rerun()
+# Note: we don't re-check this image's live count here on every rerun —
+# that would mean an extra Supabase round trip per image. The submit-time
+# precheck below already guards against writing a 4th evaluation, so the
+# worst case here is a user occasionally rates an image that was already
+# completed a moment ago by someone else — that submission is simply
+# discarded with a message, and they move on to the next image.
 
 # ==========================================
 # 🔹 Progress bar
@@ -346,20 +310,18 @@ if (
 st.markdown("### إلى أي مدى تبدو هذه الصورة واقعية؟")
 st.caption("تذكير: هذا الخبر والصورة المرفقة مُولَّدان اصطناعياً وليسا حقيقيَّين.")
 
-image_rating = st.slider(
+image_rating = st.radio(
     "تقييم الصورة (1 = تبدو مزيفة بشكل واضح، 5 = تبدو واقعية جداً):",
-    min_value=1,
-    max_value=5,
-    value=3
+    ["1", "2", "3", "4", "5"], 
+    horizontal=True
 )
 
 st.markdown("### إلى أي مدى يبدو هذا العنوان واقعياً؟")
 
-title_rating = st.slider(
+title_rating = st.radio(
     "تقييم العنوان (1 = يبدو مزيفاً بشكل واضح، 5 = يبدو واقعياً جداً):",
-    min_value=1,
-    max_value=5,
-    value=3
+    ["1", "2", "3", "4", "5"], 
+    horizontal=True
 )
 
 # ==========================================
@@ -381,7 +343,6 @@ if st.button("إرسال"):
 
         st.warning("⚠️ تم تقييم هذه الصورة بالفعل من قِبل 3 مستخدمين آخرين، سيتم الانتقال للصورة التالية")
         st.session_state.current_position += 1
-        st.cache_data.clear()
         st.rerun()
 
     try:
@@ -398,9 +359,6 @@ if st.button("إرسال"):
     except Exception as e:
         # Most likely a duplicate (unique constraint on image_id+user_id)
         st.warning(f"⚠️ لم يتم حفظ هذا التقييم (ربما تم إرساله مسبقاً). سيتم الانتقال للصورة التالية.\n\n{e}")
-
-    # Clear cached counts so the next page load reflects this submission
-    st.cache_data.clear()
 
     st.session_state.current_position += 1
     st.rerun()
