@@ -34,7 +34,7 @@ IMAGES_DIR = os.path.join(DATA_DIR, "GeneratedImagesToEvaluate")
 ITEMS_CSV_PATH = os.path.join(IMAGES_DIR, "generated_image_dataset_filtered.csv")
 
 MAX_IMAGES_PER_USER = 25
-MAX_EVALS_PER_IMAGE = 5
+MAX_EVALS_PER_IMAGE = 3
 
 # ==========================================
 # 🔹 Supabase client
